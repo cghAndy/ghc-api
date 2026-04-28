@@ -144,6 +144,18 @@ session_flush_interval: 5
 enable_web_search_proxy: false
 web_search_proxy_endpoint: "http://127.0.0.1:5002"
 
+# Memory Cache Settings
+# ---------------------
+# Controls the in-memory request/response cache used by the dashboard.
+#
+# max_size_mb: Maximum total memory used by cached request/response bodies (MB).
+#              When exceeded, the oldest entries are evicted (FIFO).
+# max_entries: Hard cap on the number of cached entries (safety fallback).
+#              Entries are also evicted when this limit is exceeded.
+cache:
+  max_size_mb: 200    # Maximum total memory for cached bodies in MB (default: 200)
+  max_entries: 10000  # Hard cap on number of cached entries (default: 10000)
+
 """.format(
         vscode_version=DEFAULT_VSCODE_VERSION,
         api_version=DEFAULT_API_VERSION,

@@ -10,7 +10,7 @@ A Python Flask application that serves as a proxy server for GitHub Copilot API,
 - **Model Name Mapping**: Translate model names with exact and prefix-based matching
 - **Token Management**: Automatic GitHub Copilot token refresh
 - **Vision Support**: Handle image inputs and enable vision capabilities
-- **Memory Caching**: Cache all requests and responses (up to 1000 entries)
+- **Memory Caching**: Cache recent requests and responses in memory with a configurable size limit in MB (default 200 MB), evicted FIFO when full
 - **Web Dashboard**: Real-time statistics and request browser
 - **Request Details**: View full request/response bodies with JSON formatting
 - **Export/Import**: Export and import request history as JSON Lines files
@@ -100,6 +100,11 @@ save_request_to_file: false # If true, save completed requests to requests/YYYY-
 
 # Optional OneDrive access gate
 disable_onedrive_access: true # If true, skip all OneDrive detection/sync/shared reads
+
+# Memory Cache Settings
+cache:
+  max_size_mb: 200    # Maximum total memory for cached request/response bodies (MB)
+  max_entries: 10000  # Hard cap on number of cached entries (safety fallback)
 ```
 
 ### Token Management

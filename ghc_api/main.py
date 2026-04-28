@@ -96,6 +96,24 @@ def main():
         if 'web_search_proxy_endpoint' in config:
             state.web_search_proxy_endpoint = config['web_search_proxy_endpoint']
 
+        # Load cache settings
+        cache_config = config.get('cache', {}) or {}
+        from .cache import cache as request_cache
+        _cache_defaults = {'max_size_mb': 200, 'max_entries': 10000}
+        for _key, _default in _cache_defaults.items():
+            _raw = cache_config.get(_key, _default)
+            try:
+                _val = int(_raw)
+                if _val <= 0:
+                    raise ValueError(f"cache.{_key} must be > 0, got {_val}")
+            except (TypeError, ValueError) as _e:
+                print(f"[Config] Warning: invalid cache.{_key}={_raw!r} ({_e}), using default {_default}")
+                _val = _default
+            if _key == 'max_size_mb':
+                request_cache.max_size_bytes = _val * 1024 * 1024
+            else:
+                request_cache.max_entries = _val
+
         # Load model mappings from config
         if 'model_mappings' in config:
             model_mappings.load_from_config(config)
