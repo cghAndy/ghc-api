@@ -22,8 +22,9 @@ class RequestCache:
     STATE_COMPLETED = "completed"
     STATE_ERROR = "error"
 
-    def __init__(self, max_entries: int = 1000):
-        self.max_entries = max_entries
+    def __init__(self, max_size_mb: int = 200, max_entries: int = 10000):
+        self.max_size_bytes = int(max_size_mb) * 1024 * 1024
+        self.max_entries = int(max_entries)
         self.cache: OrderedDict = OrderedDict()
         self.lock = threading.Lock()
         self.request_count = 0
@@ -31,6 +32,8 @@ class RequestCache:
         self.bytes_received = 0
         self.model_stats: Dict[str, Dict] = {}
         self.endpoint_stats: Dict[str, Dict] = {}
+        self.current_size_bytes: int = 0
+        self.entry_sizes: Dict[str, int] = {}
 
     @staticmethod
     def _current_timestamp() -> int:
@@ -57,12 +60,54 @@ class RequestCache:
 
         return cls._current_timestamp()
 
+    @staticmethod
+    def _estimate_entry_size(entry: Dict) -> int:
+        """Estimate memory size (bytes) of the heavy fields in an entry."""
+        total = 0
+        for field in ("request_headers", "original_request_body", "request_body", "response_body"):
+            value = entry.get(field)
+            if value is None:
+                continue
+            try:
+                if isinstance(value, bytes):
+                    total += len(value)
+                elif isinstance(value, str):
+                    total += len(value.encode("utf-8"))
+                else:
+                    total += len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+            except Exception:
+                total += len(repr(value))
+        return total
+
+    def _evict_until_within_limits(self) -> None:
+        """Evict oldest entries until cache is within size and count limits.
+
+        Must be called while self.lock is held.
+        """
+        while self.cache and (
+            len(self.cache) > self.max_entries
+            or self.current_size_bytes > self.max_size_bytes
+        ):
+            oldest_id, _ = self.cache.popitem(last=False)
+            self.current_size_bytes -= self.entry_sizes.pop(oldest_id, 0)
+        if self.current_size_bytes < 0:
+            self.current_size_bytes = 0
+
+    def _update_entry_size(self, request_id: str) -> None:
+        """Recompute and update the tracked size for an existing entry.
+
+        Must be called while self.lock is held.
+        """
+        new_size = self._estimate_entry_size(self.cache[request_id])
+        old_size = self.entry_sizes.get(request_id, 0)
+        self.current_size_bytes += new_size - old_size
+        if self.current_size_bytes < 0:
+            self.current_size_bytes = 0
+        self.entry_sizes[request_id] = new_size
+
     def start_request(self, request_id: str, data: Dict) -> None:
         """Start tracking a new request (before sending to upstream)"""
         with self.lock:
-            if len(self.cache) >= self.max_entries:
-                self.cache.popitem(last=False)
-
             self.cache[request_id] = {
                 "id": request_id,
                 "timestamp": self._current_timestamp(),
@@ -83,6 +128,10 @@ class RequestCache:
                 "duration": 0,
                 "state": self.STATE_PENDING,
             }
+            entry_size = self._estimate_entry_size(self.cache[request_id])
+            self.entry_sizes[request_id] = entry_size
+            self.current_size_bytes += entry_size
+            self._evict_until_within_limits()
 
     def update_request_state(self, request_id: str, state: str, **kwargs) -> None:
         """Update the state and optional fields of an existing request"""
@@ -92,6 +141,8 @@ class RequestCache:
                 for key, value in kwargs.items():
                     if key in self.cache[request_id]:
                         self.cache[request_id][key] = value
+                self._update_entry_size(request_id)
+                self._evict_until_within_limits()
 
     def complete_request(self, request_id: str, data: Dict) -> None:
         """Complete a request with response data and update statistics"""
@@ -109,11 +160,10 @@ class RequestCache:
                 entry["cache_read_input_tokens"] = data.get("cache_read_input_tokens", 0)
                 entry["duration"] = data.get("duration", 0)
                 entry["state"] = self.STATE_COMPLETED if data.get("status_code", 200) < 400 else self.STATE_ERROR
+                self._update_entry_size(request_id)
+                self._evict_until_within_limits()
             else:
                 # Fallback: create new entry if somehow missing
-                if len(self.cache) >= self.max_entries:
-                    self.cache.popitem(last=False)
-
                 self.cache[request_id] = {
                     "id": request_id,
                     "timestamp": self._current_timestamp(),
@@ -134,7 +184,10 @@ class RequestCache:
                     "duration": data.get("duration", 0),
                     "state": self.STATE_COMPLETED if data.get("status_code", 200) < 400 else self.STATE_ERROR,
                 }
-
+                entry_size = self._estimate_entry_size(self.cache[request_id])
+                self.entry_sizes[request_id] = entry_size
+                self.current_size_bytes += entry_size
+                self._evict_until_within_limits()
             self.request_count += 1
             self.bytes_sent += data.get("request_size", 0)
             self.bytes_received += data.get("response_size", 0)
@@ -234,6 +287,11 @@ class RequestCache:
                 "bytes_received": self.bytes_received,
                 "model_stats": dict(self.model_stats),
                 "endpoint_stats": dict(self.endpoint_stats),
+                "cache_size_bytes": self.current_size_bytes,
+                "cache_size_mb": round(self.current_size_bytes / (1024 * 1024), 2),
+                "cache_max_size_mb": self.max_size_bytes // (1024 * 1024),
+                "cache_entry_count": len(self.cache),
+                "cache_max_entries": self.max_entries,
             }
 
     def get_model_token_snapshot(self) -> Dict[str, Dict[str, int]]:
@@ -291,9 +349,6 @@ class RequestCache:
         with self.lock:
             request_id = data.get("id", str(uuid.uuid4()))
 
-            if len(self.cache) >= self.max_entries:
-                self.cache.popitem(last=False)
-
             self.cache[request_id] = {
                 "id": request_id,
                 "timestamp": self._normalize_import_timestamp(data.get("timestamp")),
@@ -314,6 +369,10 @@ class RequestCache:
                 "duration": data.get("duration", 0),
                 "state": data.get("state", "completed"),
             }
+            entry_size = self._estimate_entry_size(self.cache[request_id])
+            self.entry_sizes[request_id] = entry_size
+            self.current_size_bytes += entry_size
+            self._evict_until_within_limits()
 
             # Update stats
             self.request_count += 1
