@@ -16,6 +16,7 @@ from ..api_helpers import (
     get_copilot_base_url,
     get_copilot_headers,
     supports_direct_anthropic_api,
+    supported_reasoning_efforts,
     count_tokens,
 )
 from ..cache import cache
@@ -43,46 +44,22 @@ COPILOT_SUPPORTED_FIELDS = {
     "tools", "tool_choice", "thinking", "service_tier", "output_config",
 }
 
-# Per-model supported reasoning effort values, keyed by translated model name.
-# Passing an unsupported value makes Copilot reject the whole request (400
-# invalid_reasoning_effort), so unsupported values must be dropped, not forwarded.
-MODEL_EFFORT_SUPPORT = {
-    "claude-opus-4.7-1m-internal": {"low", "medium", "high", "xhigh"},
-    "claude-opus-4.7-high": {"high"},
-    "claude-opus-4.7-xhigh": {"xhigh"},
-    "claude-opus-4.7": {"medium"},
-    "claude-opus-4.8": {"medium"},
-    "claude-opus-4.6-1m": {"low", "medium", "high"},
-    "claude-opus-4.5": set(),
-}
-
-# Normalize Claude Code effort values to Copilot's vocabulary.
-EFFORT_VALUE_ALIASES = {
-    "max": "xhigh",
-}
-
-
 def apply_effort_policy(payload: Dict, translated_model: str) -> Dict:
-    """Keep output_config only when the target model supports the (normalized) effort value."""
+    """Keep output_config.effort only if Copilot reports the model supports
+    that exact value; otherwise drop output_config. No value normalization."""
     output_config = payload.get("output_config")
     if not isinstance(output_config, dict):
         return payload
-
     eff = output_config.get("effort")
     if eff is None:
         return payload
 
-    normalized = EFFORT_VALUE_ALIASES.get(eff, eff)
-    supported = MODEL_EFFORT_SUPPORT.get(translated_model)
+    supported = supported_reasoning_efforts(translated_model)
+    if eff in supported:
+        return payload  # forward as-is
 
-    if supported is None:
-        print(f"[Effort] Model {translated_model} not in effort table; dropping output_config (effort={eff})")
-        return {k: v for k, v in payload.items() if k != "output_config"}
-
-    if normalized in supported:
-        return {**payload, "output_config": {**output_config, "effort": normalized}}
-
-    print(f"[Effort] Model {translated_model} does not support effort={eff} (normalized={normalized}); dropping output_config")
+    print(f"[Effort] Model {translated_model} does not support effort={eff} "
+          f"(supported: {sorted(supported) or 'none'}); dropping output_config")
     return {k: v for k, v in payload.items() if k != "output_config"}
 
 
