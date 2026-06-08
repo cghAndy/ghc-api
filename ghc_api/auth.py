@@ -223,7 +223,7 @@ class UserRegistry:
         if not user_id:
             return None, "user_id is required"
         if len(user_id) > 64:
-            return None, "user_id is too long (max 64 chars)"
+            return None, "user_id is too long (must be 64 characters or less)"
         if user_id == ANONYMOUS_USER_ID:
             return None, f"'{ANONYMOUS_USER_ID}' is reserved"
         # Keep IDs URL-safe and easy to type in the dashboard.

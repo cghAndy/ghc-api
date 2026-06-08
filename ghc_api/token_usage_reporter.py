@@ -298,7 +298,8 @@ def get_token_usage_overview(range_key: str = "all", user_filter: str | None = N
                         continue
 
                     # Lines emitted before per-user support have no "user_id".
-                    line_user_id = str(payload.get("user_id") or ANONYMOUS_USER_ID)
+                    raw_user_id = payload.get("user_id")
+                    line_user_id = (str(raw_user_id).strip() if raw_user_id is not None else "") or ANONYMOUS_USER_ID
                     users_seen.add(line_user_id)
 
                     if user_filter is not None and line_user_id != user_filter:

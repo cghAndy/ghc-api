@@ -49,7 +49,10 @@ def _runtime_config() -> Dict[str, Any]:
 
 
 def _user_filter_from_request() -> str | None:
-    """Read the optional ?user=<id> query parameter. Empty / 'all' / 'any' = no filter."""
+    """Read the optional ?user=<id> query parameter.
+
+    Reserved values for "no filter": empty string, 'all', 'any', '*'.
+    """
     raw = request.args.get("user")
     if raw is None:
         return None

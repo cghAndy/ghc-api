@@ -26,8 +26,8 @@ PROTECTED_PATHS = frozenset({
     "/v1/messages/count_tokens",
     "/v1/models",
     "/models",
-    "/v1/models/full/",
-    "/models/full/",
+    "/v1/models/full",
+    "/models/full",
 })
 
 
@@ -43,7 +43,8 @@ def create_app() -> Flask:
             g.user_id = ANONYMOUS_USER_ID
             return None
 
-        if request.path not in PROTECTED_PATHS:
+        request_path = request.path.rstrip("/") or "/"
+        if request_path not in PROTECTED_PATHS:
             g.user_id = ANONYMOUS_USER_ID
             return None
 
