@@ -13,10 +13,13 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 from .cache import cache
 from .config_sync import get_agent_root, get_onedrive_path
+
+
+ANONYMOUS_USER_ID = "anonymous"
 
 
 class TokenUsageReporter:
@@ -24,7 +27,8 @@ class TokenUsageReporter:
         self.interval_seconds = interval_seconds
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._last_snapshot: Dict[str, Dict[str, int]] = cache.get_model_token_snapshot()
+        # Keyed by (user_id, model) so we can emit per-user deltas.
+        self._last_snapshot: Dict[Tuple[str, str], Dict[str, int]] = cache.get_user_model_token_snapshot()
         self._write_lock = threading.Lock()
 
     def start(self) -> None:
@@ -53,13 +57,18 @@ class TokenUsageReporter:
         if not usage_file:
             return
 
-        current = cache.get_model_token_snapshot()
-        delta_models = []
+        current = cache.get_user_model_token_snapshot()
 
-        model_names = sorted(set(self._last_snapshot.keys()) | set(current.keys()))
-        for model_name in model_names:
-            prev = self._last_snapshot.get(model_name, {})
-            now = current.get(model_name, {})
+        # Group deltas by user so we emit one JSONL line per (timestamp, user_id)
+        # with all of that user's per-model deltas in a single line. That keeps
+        # files small and lets readers aggregate by (machine, user, model).
+        by_user: Dict[str, list] = {}
+
+        all_keys = set(self._last_snapshot.keys()) | set(current.keys())
+        for key in sorted(all_keys):
+            user_id, model_name = key
+            prev = self._last_snapshot.get(key, {})
+            now = current.get(key, {})
 
             delta_request_count = max(0, int(now.get("request_count", 0)) - int(prev.get("request_count", 0)))
             delta_input = max(0, int(now.get("input_tokens", 0)) - int(prev.get("input_tokens", 0)))
@@ -71,7 +80,7 @@ class TokenUsageReporter:
             if delta_total == 0 and delta_total_data == 0 and delta_request_count == 0:
                 continue
 
-            delta_models.append({
+            by_user.setdefault(user_id, []).append({
                 "model": model_name,
                 "request_count": delta_request_count,
                 "input_tokens": delta_input,
@@ -83,18 +92,23 @@ class TokenUsageReporter:
             })
 
         self._last_snapshot = current
-        if not delta_models:
+        if not by_user:
             return
 
-        payload = {
-            "timestamp": int(time.time()),
-            "models": delta_models,
-        }
+        ts = int(time.time())
+        lines = []
+        for user_id, models in by_user.items():
+            payload = {
+                "timestamp": ts,
+                "user_id": user_id,
+                "models": models,
+            }
+            lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
 
         try:
             usage_file.parent.mkdir(parents=True, exist_ok=True)
             with usage_file.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                f.writelines(lines)
         except Exception as e:
             print(f"[Token Usage] Failed to append usage file {usage_file}: {e}")
 
@@ -248,14 +262,24 @@ def _build_timeseries(
     return {"granularity": granularity, "times": times, "by_machine": by_machine}
 
 
-def get_token_usage_overview(range_key: str = "all") -> Dict[str, object]:
+def get_token_usage_overview(range_key: str = "all", user_filter: str | None = None) -> Dict[str, object]:
+    """Aggregate per-machine token usage across all machines.
+
+    When `user_filter` is provided, only lines matching that user_id are included
+    in the rows / per-user-rows / totals / timeseries. Old JSONL lines without a
+    "user_id" field are treated as ANONYMOUS_USER_ID for back-compat.
+    """
     usage_files = _resolve_usage_files()
     cutoff = _range_cutoff_ts(range_key)
     now_ts = int(time.time())
     machines = sorted([machine for machine, _ in usage_files], key=str.lower)
 
+    # (machine, model_id) -> aggregated stats (kept for back-compat of "rows")
     aggregate: Dict[tuple[str, str], Dict[str, int]] = {}
+    # (machine, user_id, model_id) -> aggregated stats (the new per-user dimension)
+    user_aggregate: Dict[tuple[str, str, str], Dict[str, int]] = {}
     raw_ts_data: list[tuple[str, int, int]] = []
+    users_seen: set[str] = set()
 
     for machine, path in usage_files:
         try:
@@ -271,6 +295,13 @@ def get_token_usage_overview(range_key: str = "all") -> Dict[str, object]:
 
                     ts = int(payload.get("timestamp", 0))
                     if cutoff is not None and ts < cutoff:
+                        continue
+
+                    # Lines emitted before per-user support have no "user_id".
+                    line_user_id = str(payload.get("user_id") or ANONYMOUS_USER_ID)
+                    users_seen.add(line_user_id)
+
+                    if user_filter is not None and line_user_id != user_filter:
                         continue
 
                     models = payload.get("models")
@@ -293,6 +324,17 @@ def get_token_usage_overview(range_key: str = "all") -> Dict[str, object]:
                                 "data_received": 0,
                                 "total_data": 0,
                             }
+                        user_key = (machine, line_user_id, model_id)
+                        if user_key not in user_aggregate:
+                            user_aggregate[user_key] = {
+                                "request_count": 0,
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0,
+                                "data_sent": 0,
+                                "data_received": 0,
+                                "total_data": 0,
+                            }
                         req_count = int(model_usage.get("request_count", 0) or 0)
                         input_tokens = int(model_usage.get("input_tokens", 0) or 0)
                         output_tokens = int(model_usage.get("output_tokens", 0) or 0)
@@ -301,13 +343,14 @@ def get_token_usage_overview(range_key: str = "all") -> Dict[str, object]:
                         data_received = int(model_usage.get("data_received", model_usage.get("bytes_received", 0)) or 0)
                         total_data = int(model_usage.get("total_data", data_sent + data_received) or 0)
 
-                        aggregate[key]["request_count"] += req_count
-                        aggregate[key]["input_tokens"] += input_tokens
-                        aggregate[key]["output_tokens"] += output_tokens
-                        aggregate[key]["total_tokens"] += total_tokens
-                        aggregate[key]["data_sent"] += data_sent
-                        aggregate[key]["data_received"] += data_received
-                        aggregate[key]["total_data"] += total_data
+                        for target in (aggregate[key], user_aggregate[user_key]):
+                            target["request_count"] += req_count
+                            target["input_tokens"] += input_tokens
+                            target["output_tokens"] += output_tokens
+                            target["total_tokens"] += total_tokens
+                            target["data_sent"] += data_sent
+                            target["data_received"] += data_received
+                            target["total_data"] += total_data
                         line_total_tokens += total_tokens
 
                     if line_total_tokens > 0:
@@ -316,6 +359,7 @@ def get_token_usage_overview(range_key: str = "all") -> Dict[str, object]:
             continue
 
     rows = []
+    user_rows = []
     totals = {
         "request_count": 0,
         "input_tokens": 0,
@@ -347,10 +391,30 @@ def get_token_usage_overview(range_key: str = "all") -> Dict[str, object]:
         totals["data_received"] += row["data_received"]
         totals["total_data"] += row["total_data"]
 
+    for (machine, user_id, model_id), stats in sorted(
+        user_aggregate.items(),
+        key=lambda item: (item[0][0].lower(), item[0][1].lower(), item[0][2].lower()),
+    ):
+        user_rows.append({
+            "machine": machine,
+            "user_id": user_id,
+            "model_id": model_id,
+            "request_count": stats["request_count"],
+            "input_tokens": stats["input_tokens"],
+            "output_tokens": stats["output_tokens"],
+            "total_tokens": stats["total_tokens"],
+            "data_sent": stats["data_sent"],
+            "data_received": stats["data_received"],
+            "total_data": stats["total_data"],
+        })
+
     return {
         "range": range_key,
         "machines": machines,
+        "users": sorted(users_seen, key=str.lower),
+        "user_filter": user_filter,
         "rows": rows,
+        "user_rows": user_rows,
         "totals": totals,
         "timeseries": _build_timeseries(raw_ts_data, cutoff, now_ts),
     }

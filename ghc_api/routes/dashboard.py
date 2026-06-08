@@ -18,6 +18,7 @@ from ..config_sync import (
     sync_local_to_onedrive,
     sync_onedrive_to_local,
 )
+from ..auth import ANONYMOUS_USER_ID, get_user_registry
 from ..state import state
 from ..token_usage_reporter import get_token_usage_overview
 
@@ -39,11 +40,23 @@ def _runtime_config() -> Dict[str, Any]:
         "auto_remove_encrypted_content_on_parse_error": state.auto_remove_encrypted_content_on_parse_error,
         "save_request_to_file": state.save_request_to_file,
         "disable_onedrive_access": state.disable_onedrive_access,
+        "enable_auth": state.enable_auth,
         "model_mappings": {
             "exact": model_mappings.exact_mappings,
             "prefix": model_mappings.prefix_mappings,
         },
     }
+
+
+def _user_filter_from_request() -> str | None:
+    """Read the optional ?user=<id> query parameter. Empty / 'all' / 'any' = no filter."""
+    raw = request.args.get("user")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in ("all", "any", "*"):
+        return None
+    return raw
 
 
 def _validate_string_list(value: Any, field_name: str) -> List[str]:
@@ -220,11 +233,12 @@ def api_config_manager_sync_from_onedrive():
 
 @dashboard_bp.route("/api/config-manager/token-usage", methods=["GET"])
 def api_config_manager_token_usage():
-    """Get token usage overview grouped by machine and model."""
+    """Get token usage overview grouped by machine, model, and (optionally) user."""
     range_key = request.args.get("range", "all")
     if range_key not in {"all", "hour", "day", "week", "month"}:
         return jsonify({"error": "Invalid range. Use: all, hour, day, week, month"}), 400
-    return jsonify(get_token_usage_overview(range_key))
+    user_filter = _user_filter_from_request()
+    return jsonify(get_token_usage_overview(range_key, user_filter=user_filter))
 
 
 @dashboard_bp.route("/api/config-manager/config-hashes", methods=["GET"])
@@ -241,25 +255,50 @@ def api_config_manager_software_versions():
 
 @dashboard_bp.route("/api/stats", methods=["GET"])
 def api_stats():
-    """Get API statistics"""
-    return jsonify(cache.get_stats())
+    """Get API statistics, optionally filtered to a single user via ?user=<id>."""
+    return jsonify(cache.get_stats(user_id=_user_filter_from_request()))
+
+
+@dashboard_bp.route("/api/users-list", methods=["GET"])
+def api_users_list():
+    """List user_ids known to this instance. Combines registered users with
+    user_ids that appear in the request cache (e.g. 'anonymous'). Used by the
+    dashboard's filter-by-user dropdown — no tokens returned."""
+    seen: Dict[str, Dict[str, Any]] = {}
+
+    for record in get_user_registry().list_all():
+        seen[record.user_id] = record.to_safe_dict()
+
+    for user_id in cache.list_user_ids():
+        if user_id not in seen:
+            seen[user_id] = {
+                "user_id": user_id,
+                "display_name": user_id,
+                "status": "transient" if user_id == ANONYMOUS_USER_ID else "unregistered",
+                "created_at": 0,
+                "approved_at": None,
+            }
+
+    users = sorted(seen.values(), key=lambda u: (u["user_id"] != ANONYMOUS_USER_ID, u["user_id"].lower()))
+    return jsonify({"users": users})
 
 
 @dashboard_bp.route("/api/requests", methods=["GET"])
 def api_requests():
-    """Get paginated list of requests"""
+    """Get paginated list of requests, optionally filtered by ?user=<id>."""
     page = request.args.get("page", 1, type=int)
     per_page = request.args.get("per_page", 50, type=int)
     search = request.args.get("search", "")
+    user_filter = _user_filter_from_request()
 
     offset = (page - 1) * per_page
 
     if search:
-        items = cache.search_requests(search, per_page, offset)
-        total = len(cache.search_requests(search, 10000, 0))  # Get total count
+        items = cache.search_requests(search, per_page, offset, user_id=user_filter)
+        total = len(cache.search_requests(search, 10000, 0, user_id=user_filter))  # Get total count
     else:
-        items = cache.get_recent_requests(per_page, offset)
-        total = cache.get_total_count()
+        items = cache.get_recent_requests(per_page, offset, user_id=user_filter)
+        total = cache.get_total_count(user_id=user_filter)
 
     # Remove large body content for list view
     items_summary = []
@@ -277,6 +316,7 @@ def api_requests():
         "page": page,
         "per_page": per_page,
         "total_pages": (total + per_page - 1) // per_page,
+        "user_filter": user_filter,
     })
 
 
@@ -309,10 +349,11 @@ def api_response_body(request_id: str):
 
 @dashboard_bp.route("/api/requests/search", methods=["GET"])
 def api_fulltext_search():
-    """Full-text search in request/response bodies"""
+    """Full-text search in request/response bodies, optionally filtered by ?user=<id>."""
     page = request.args.get("page", 1, type=int)
     per_page = request.args.get("per_page", 50, type=int)
     query = request.args.get("q", "")
+    user_filter = _user_filter_from_request()
 
     if not query:
         return jsonify({
@@ -321,10 +362,11 @@ def api_fulltext_search():
             "page": page,
             "per_page": per_page,
             "total_pages": 0,
+            "user_filter": user_filter,
         })
 
     offset = (page - 1) * per_page
-    items, total = cache.fulltext_search(query, per_page, offset)
+    items, total = cache.fulltext_search(query, per_page, offset, user_id=user_filter)
 
     # Remove large body content for list view
     items_summary = []
@@ -342,6 +384,7 @@ def api_fulltext_search():
         "page": page,
         "per_page": per_page,
         "total_pages": (total + per_page - 1) // per_page if total > 0 else 0,
+        "user_filter": user_filter,
     })
 
 

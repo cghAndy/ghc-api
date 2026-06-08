@@ -46,6 +46,13 @@ class State:
         self.enable_web_search_proxy: bool = False
         self.web_search_proxy_endpoint: str = ""
 
+        # User authentication settings
+        # When True, /v1/chat/completions, /v1/messages, /v1/responses, /v1/models
+        # require an approved token from the user registry (users.json).
+        # When False (default), all requests are tagged with user_id="anonymous"
+        # and no auth check is performed.
+        self.enable_auth: bool = False
+
         # Session persistence settings
         self.session_flush_interval: int = 5  # seconds between buffered writes
 

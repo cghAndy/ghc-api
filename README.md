@@ -21,6 +21,7 @@ A Python Flask application that serves as a proxy server for GitHub Copilot API,
 - **Config Sync**: Sync Claude Code, Codex, and ghc-api config files with OneDrive
 - **Safe Backups**: Auto backup overwritten config files as `*.YYYYMMDD_HHMMSS.bak`
 - **Machine Token Usage Logs**: Periodic token usage JSONL per machine with cross-machine overview in dashboard
+- **Optional User-Token Auth**: Opt-in middleware gates LLM endpoints behind self-signup + admin-approved tokens; requests, stats, and token usage are then grouped per user
 
 ## Installation
 
@@ -194,6 +195,83 @@ Session data is stored in:
 
 Recent working directories are persisted to `workdirs.json` in the same location. Sessions from other machines are browsable via the machine selector dropdown when OneDrive is enabled.
 
+### User-Token Authentication (Optional)
+
+When you want to share a single ghc-api instance among multiple people without giving everyone unrestricted access to the deployer's Copilot quota, enable token auth:
+
+```bash
+ghc-api --enable-auth
+# or set in ~/.ghc-api/config.yaml:
+#   enable_auth: true
+```
+
+Once enabled, LLM endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/models`, plus their non-`/v1` aliases) require an approved user token. Dashboard and admin endpoints stay open at the Flask layer — they're expected to be gated by a reverse proxy in production (see [Production Deployment](#production-deployment)).
+
+**Self-signup flow**:
+
+1. User opens `http://<host>:8313/signup`, fills `user_id` (letters/digits/`_-.`, max 64 chars) and an optional display name, submits.
+2. Server generates a token of the form `gha_<43 url-safe chars>`, returns it once. Status is `pending`.
+3. Admin opens the dashboard → **Code Agent Manager** → **Users** section → clicks **Approve** next to the new user. (Or `curl -X POST http://localhost:8313/api/users/<id>/approve`.)
+4. The user can now use the token. Revocation and deletion are available from the same panel.
+
+**Token presentation** (middleware accepts any of these, first match wins):
+
+1. `Authorization: Bearer <token>` — OpenAI SDK, Claude Code (`ANTHROPIC_AUTH_TOKEN`), Codex, curl
+2. `x-api-key: <token>` — Anthropic SDK (`ANTHROPIC_API_KEY`)
+3. `?api_key=<token>` query parameter — curl one-liners
+
+**Client configuration examples** (assuming server at `localhost:8313` and an approved token `gha_abc...xyz`):
+
+*Claude Code* — `~/.claude/settings.json`:
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8313",
+    "ANTHROPIC_AUTH_TOKEN": "gha_abc...xyz"
+  }
+}
+```
+Note: `ANTHROPIC_BASE_URL` is **without** `/v1`. Prefer `ANTHROPIC_AUTH_TOKEN` over `ANTHROPIC_API_KEY` for proxies.
+
+*Codex* — `~/.codex/config.toml`:
+```toml
+model_provider = "ghc-api"
+model = "gpt-4o"
+
+[model_providers.ghc-api]
+name = "GHC API Proxy"
+base_url = "http://localhost:8313/v1"
+env_key = "GHC_API_TOKEN"
+wire_api = "chat"   # or "responses"
+```
+Then `export GHC_API_TOKEN=gha_abc...xyz`. Note: Codex's `base_url` **includes** `/v1`.
+
+*OpenAI Python SDK*:
+```python
+client = OpenAI(base_url="http://localhost:8313/v1", api_key="gha_abc...xyz")
+```
+
+*Anthropic Python SDK*:
+```python
+client = anthropic.Anthropic(base_url="http://localhost:8313", api_key="gha_abc...xyz")
+```
+
+*curl*:
+```bash
+curl http://localhost:8313/v1/chat/completions \
+  -H "Authorization: Bearer gha_abc...xyz" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+```
+
+**Per-user dashboard views**: with auth on, the request browser, statistics, and cross-machine token-usage overview all gain a "Filter by user" dropdown. Requests issued before auth was enabled (and any anonymous calls when auth is off) show up under a single `anonymous` bucket.
+
+**Token registry storage**:
+- If OneDrive is detected and `disable_onedrive_access: false`: `{OneDrive}/.ghc-api/configSync/users.json` (shared across machines — register once, use anywhere).
+- Otherwise: `~/.ghc-api/users.json` (local-only).
+
+The registry file is re-read whenever its mtime changes (checked every 5 seconds), so approval / revocation on one machine propagates to others as soon as OneDrive syncs the file.
+
 ## API Endpoints
 
 ### OpenAI Compatible
@@ -227,6 +305,20 @@ Recent working directories are persisted to `workdirs.json` in the same location
 - `POST /api/config-manager/sync-from-onedrive` - Copy OneDrive config to local machine with backups
 - `GET /api/config-manager/token-usage?range=all|day|week|month` - Cross-machine token usage overview
 - `GET /api/config-manager/config-hashes` - Config hash overview for shared OneDrive and each machine (with create time)
+
+### User Authentication
+
+Active only when `enable_auth: true`. See [User-Token Authentication](#user-token-authentication-optional) above.
+
+- `GET /signup` - Self-signup form (public)
+- `POST /signup` - Create a pending user, return token (public)
+- `GET /api/users-list` - User list without tokens, for filter dropdowns (public)
+- `GET /api/users` - Full user list including tokens (admin: gate behind reverse proxy)
+- `POST /api/users/<user_id>/approve` - Mark a pending user as approved (admin)
+- `POST /api/users/<user_id>/revoke` - Revoke an approved user (admin)
+- `DELETE /api/users/<user_id>` - Remove a user from the registry (admin)
+
+Per-user filtering is also available on existing endpoints via the `?user=<user_id>` query parameter: `/api/stats`, `/api/requests`, `/api/requests/search`, `/api/config-manager/token-usage`.
 
 ### Code Agent (ACP)
 
@@ -313,6 +405,90 @@ Access the web dashboard at `http://localhost:8313/` to:
   - Toggle verbose mode for detailed tool inputs/outputs, stdout/stderr, and token usage
   - Browse sessions across machines via OneDrive
   - Resume viewing past session history
+
+## Production deployment
+
+When you expose ghc-api beyond `localhost` (sharing a single instance with other people, putting it on a VPS, etc.), put a reverse proxy in front to authenticate admin paths. ghc-api intentionally does **not** authenticate dashboard pages or admin APIs at the Flask layer — that responsibility is delegated to your reverse proxy.
+
+### Path classification
+
+| Category | Paths | How to gate |
+|---|---|---|
+| **Public — LLM API** | `POST /v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/responses`, `GET /v1/models`, `/models`, `/v1/models/full/`, `/models/full/` | No basic-auth (clients send `Authorization: Bearer <user-token>`); ghc-api's own middleware checks the user token when `enable_auth=true` |
+| **Public — signup** | `GET /signup`, `POST /signup`, `GET /api/users-list` (token-redacted) | No basic-auth — anyone may request an account |
+| **Admin — user mgmt** | `GET /api/users`, `POST /api/users/<id>/approve`, `POST /api/users/<id>/revoke`, `DELETE /api/users/<id>` | basic-auth — `GET /api/users` returns plaintext tokens |
+| **Admin — config & data** | `POST /api/runtime-config`, `POST /api/config-manager/install-tools`, `POST /api/config-manager/sync-to-onedrive`, `POST /api/config-manager/sync-from-onedrive`, `POST /api/requests/import` | basic-auth — affect global state |
+| **Admin — dashboard & inspection** | `GET /`, `/requests`, `/code-agent-manager`, `/chat`, `/agent`, all `GET /api/stats`, `/api/requests*`, `/api/request/<id>*`, `/api/config-manager/*`, `/api/agent/*` | basic-auth — request bodies expose other users' prompts |
+
+### Sample nginx config
+
+Default-deny strategy: protect everything with basic-auth, then explicitly allow the public paths.
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name ghc.example.com;
+
+    # ssl_certificate / ssl_certificate_key go here
+
+    # Default for the whole server: admin basic-auth required.
+    auth_basic "ghc-api admin";
+    auth_basic_user_file /etc/nginx/ghc-api.htpasswd;
+
+    # ---- Public: LLM API (auth is enforced by ghc-api itself via user tokens) ----
+    location /v1/ {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:8313;
+        proxy_buffering off;          # SSE / streaming responses
+        proxy_read_timeout 1200s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    # Aliases without the /v1 prefix
+    location ~ ^/(chat/completions|responses|models)(/|$) {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:8313;
+        proxy_buffering off;
+        proxy_read_timeout 1200s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    # ---- Public: signup page and token-redacted user list ----
+    location = /signup {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:8313;
+    }
+    location = /api/users-list {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:8313;
+    }
+
+    # ---- Everything else: admin basic-auth applies ----
+    location / {
+        proxy_pass http://127.0.0.1:8313;
+        proxy_buffering off;
+        proxy_read_timeout 1200s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+Create the password file (use bcrypt via `-B`):
+
+```bash
+sudo htpasswd -cB /etc/nginx/ghc-api.htpasswd admin
+# add more admins later without -c:
+sudo htpasswd -B /etc/nginx/ghc-api.htpasswd alice
+```
+
+### Critical caveats
+
+- **Never apply `auth_basic` to LLM API paths.** Clients like Codex, Claude Code, and the OpenAI SDK send `Authorization: Bearer <token>`, not HTTP basic. nginx would 401 the request before ghc-api ever sees it.
+- **Always set `proxy_buffering off;` and a long `proxy_read_timeout`** for any location that forwards LLM traffic — otherwise streamed responses stall or get truncated.
+- **The two `Authorization` schemes don't conflict**: basic-auth lives in admin `location` blocks (`Authorization: Basic ...`), user tokens live in LLM `location` blocks (`Authorization: Bearer ...`). They never coexist on the same request.
+- **For local-only single-user use without nginx**, bind ghc-api to localhost so the admin endpoints aren't reachable from the network: `ghc-api --enable-auth -a 127.0.0.1`.
 
 ## Architecture
 

@@ -1003,6 +1003,12 @@
                             <option value="100">100</option>
                         </select>
                     </div>
+                    <div class="per-page-select">
+                        <label for="user-filter">User:</label>
+                        <select id="user-filter">
+                            <option value="">All users</option>
+                        </select>
+                    </div>
                     <div class="request-count" id="request-count">0 requests</div>
                 </div>
             </div>
@@ -1629,6 +1635,11 @@
                     per_page: perPage,
                 });
 
+                const userFilter = document.getElementById('user-filter').value;
+                if (userFilter) {
+                    params.set('user', userFilter);
+                }
+
                 let endpoint = '/api/requests';
                 if (searchQuery) {
                     if (searchType === 'fulltext') {
@@ -2054,7 +2065,40 @@
         });
 
         // Initial load
+        loadUserFilterOptions();
         loadRequests();
+
+        document.getElementById('user-filter').addEventListener('change', () => {
+            currentPage = 1;
+            loadRequests();
+        });
+
+        async function loadUserFilterOptions() {
+            try {
+                const response = await fetch('/api/users-list');
+                const data = await response.json();
+                const select = document.getElementById('user-filter');
+                const previous = select.value;
+                select.innerHTML = '<option value="">All users</option>';
+                for (const user of data.users || []) {
+                    const opt = document.createElement('option');
+                    opt.value = user.user_id;
+                    const labelExtra = user.display_name && user.display_name !== user.user_id
+                        ? ` — ${user.display_name}`
+                        : '';
+                    const statusBadge = user.status && user.status !== 'approved'
+                        ? ` [${user.status}]`
+                        : '';
+                    opt.textContent = `${user.user_id}${labelExtra}${statusBadge}`;
+                    select.appendChild(opt);
+                }
+                if (previous && [...select.options].some(o => o.value === previous)) {
+                    select.value = previous;
+                }
+            } catch (e) {
+                console.error('Failed to load user list', e);
+            }
+        }
     </script>
 </body>
 </html>
