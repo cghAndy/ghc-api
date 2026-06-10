@@ -104,7 +104,7 @@ def initialize_app() -> None:
     refresh_copilot_token()
     fetch_models()
 
-    if not state.token_usage_reporter_started:
+    if state.enable_token_usage_reporter and not state.token_usage_reporter_started:
         start_token_usage_reporter()
         state.token_usage_reporter_started = True
 

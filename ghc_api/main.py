@@ -93,6 +93,8 @@ def main():
             state.disable_onedrive_access = bool(config['disable_onedrive_access'])
         if 'session_flush_interval' in config:
             state.session_flush_interval = int(config['session_flush_interval'])
+        if 'enable_token_usage_reporter' in config:
+            state.enable_token_usage_reporter = bool(config['enable_token_usage_reporter'])
 
         # Load web search proxy settings
         if 'enable_web_search_proxy' in config:

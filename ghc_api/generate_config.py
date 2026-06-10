@@ -130,6 +130,14 @@ disable_onedrive_access: true
 # Lower values mean less data loss on crash but more disk I/O.
 session_flush_interval: 5
 
+# Token Usage Reporter
+# --------------------
+# When true, a background worker periodically writes per-user/model token usage
+# deltas to the OneDrive agent folder (token_usage.jl), or a local fallback file
+# (~/.ghc-api/token_usage.jl) when OneDrive is unavailable.
+# When false (default), the reporter never starts.
+enable_token_usage_reporter: false
+
 # Web Search Proxy Settings
 # -------------------------
 # When enabled, if the Copilot backend rejects a request containing the web_search tool

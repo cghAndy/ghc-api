@@ -151,7 +151,7 @@ On startup, ghc-api checks synced files and prints config differences to stdout 
 
 ### Token Usage Logging
 
-Every 5 minutes, ghc-api writes token usage delta (if non-zero) to:
+When `enable_token_usage_reporter: true` (default `false`), every 5 minutes ghc-api writes token usage delta (if non-zero) to:
 
 - OneDrive mode: `.ghc-api/agents/{hostname}_{os}/token_usage.jl`
 - Fallback when OneDrive is unavailable: `~/.ghc-api/token_usage.jl`
