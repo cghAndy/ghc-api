@@ -26,8 +26,8 @@ PROTECTED_PATHS = frozenset({
     "/v1/messages/count_tokens",
     "/v1/models",
     "/models",
-    "/v1/models/full",
-    "/models/full",
+    "/v1/models/full/",
+    "/models/full/",
 })
 
 
@@ -43,8 +43,7 @@ def create_app() -> Flask:
             g.user_id = ANONYMOUS_USER_ID
             return None
 
-        request_path = request.path.rstrip("/") or "/"
-        if request_path not in PROTECTED_PATHS:
+        if request.path not in PROTECTED_PATHS:
             g.user_id = ANONYMOUS_USER_ID
             return None
 
@@ -104,7 +103,7 @@ def initialize_app() -> None:
     refresh_copilot_token()
     fetch_models()
 
-    if state.enable_token_usage_reporter and not state.token_usage_reporter_started:
+    if not state.token_usage_reporter_started:
         start_token_usage_reporter()
         state.token_usage_reporter_started = True
 

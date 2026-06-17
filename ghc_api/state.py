@@ -56,11 +56,9 @@ class State:
         # Session persistence settings
         self.session_flush_interval: int = 5  # seconds between buffered writes
 
-        # Token usage reporter settings
-        # When True, a background worker periodically writes per-user/model token
-        # usage deltas to the OneDrive agent folder (or a local fallback file).
-        # When False (default), the reporter never starts.
-        self.enable_token_usage_reporter: bool = False
+        # Request cache memory limits
+        self.cache_max_entries: int = 1000  # Max number of requests kept in memory
+        self.cache_max_request_size: int = 1024 * 1024  # Max bytes per cached entry body (0 disables limit)
 
         # Background worker guards
         self.token_usage_reporter_started: bool = False

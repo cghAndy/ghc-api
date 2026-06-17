@@ -29,7 +29,7 @@ from ..translator import (
     apply_system_prompt_filters,
     apply_tool_result_suffix_filter,
 )
-from ..utils import log_error_request, is_orphaned_tool_result_error, remove_orphaned_tool_results, extract_orphaned_tool_use_ids, log_tool_result_cleanup, log_connection_retry
+from ..utils import log_error_request, is_orphaned_tool_result_error, remove_orphaned_tool_results, extract_orphaned_tool_use_ids, log_tool_result_cleanup, log_connection_retry, get_client_ip
 from ..state import state
 from ..web_search import has_web_search_tool, is_web_search_unsupported_error, apply_web_search_fallback
 
@@ -67,6 +67,66 @@ def apply_effort_policy(payload: Dict, translated_model: str) -> Dict:
     print(f"[Effort] Model {translated_model} does not support effort={eff} "
           f"(supported: {sorted(supported) or 'none'}); dropping output_config")
     return {k: v for k, v in payload.items() if k != "output_config"}
+
+
+def translate_thinking_enabled_to_adaptive(payload: Dict, translated_model: str) -> Dict:
+    """Translate legacy thinking.type=enabled to the new adaptive protocol when
+    the target model only accepts the new one.
+
+    Newer Copilot-served Claude models (Opus 4.7+) reject thinking.type=enabled
+    with a 400 ("Use thinking.type.adaptive and output_config.effort"). This shim
+    auto-translates so old clients keep working without code changes.
+
+    Trigger: thinking.type=="enabled" AND the model reports a non-empty
+    reasoning_effort capability. Models without reasoning_effort are treated as
+    old-protocol and pass through unchanged.
+
+    Mapping (budget_tokens -> effort): <4096 low, <16384 medium, >=16384 high.
+    xhigh/max are intentionally not auto-selected since not every effort-aware
+    model supports them; apply_effort_policy gates the result either way.
+
+    A client-supplied output_config.effort always wins over the mapped value.
+    max_tokens is bumped to preserve response headroom that the original
+    budget_tokens implied (mirrors adjust_max_tokens_for_thinking, since
+    budget_tokens is dropped by this translation).
+    """
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
+        return payload
+
+    if not supported_reasoning_efforts(translated_model):
+        return payload
+
+    budget_tokens = thinking.get("budget_tokens") or 0
+    if budget_tokens and budget_tokens < 4096:
+        mapped_effort = "low"
+    elif budget_tokens < 16384:
+        mapped_effort = "medium"
+    else:
+        mapped_effort = "high"
+
+    new_payload = {**payload, "thinking": {"type": "adaptive"}}
+
+    existing_oc = payload.get("output_config")
+    if isinstance(existing_oc, dict) and existing_oc.get("effort") is not None:
+        print(f"[ThinkingTranslate] {translated_model}: enabled(budget={budget_tokens}) "
+              f"-> adaptive; preserving client effort={existing_oc.get('effort')}")
+    else:
+        merged_oc = dict(existing_oc) if isinstance(existing_oc, dict) else {}
+        merged_oc["effort"] = mapped_effort
+        new_payload["output_config"] = merged_oc
+        print(f"[ThinkingTranslate] {translated_model}: enabled(budget={budget_tokens}) "
+              f"-> adaptive + effort={mapped_effort}")
+
+    max_tokens = new_payload.get("max_tokens", 0)
+    if budget_tokens and max_tokens <= budget_tokens:
+        response_buffer = min(16384, budget_tokens)
+        new_max_tokens = budget_tokens + response_buffer
+        print(f"[ThinkingTranslate] Adjusted max_tokens: {max_tokens} -> {new_max_tokens} "
+              f"(preserving headroom from original budget_tokens={budget_tokens})")
+        new_payload["max_tokens"] = new_max_tokens
+
+    return new_payload
 
 
 def _remove_scope_from_ephemeral_cache_control(block: Dict) -> None:
@@ -375,8 +435,9 @@ def anthropic_messages():
     anthropic_payload = request.get_json()
     request_id = str(uuid.uuid4())
 
-    # Capture incoming request headers
+    # Capture incoming request headers (auth values redacted before caching).
     request_headers = redact_auth_headers(dict(request.headers))
+    client_ip = get_client_ip(request)
     user_id = _current_user_id()
 
     # Store original request before any modifications
@@ -396,6 +457,11 @@ def anthropic_messages():
     # Apply tool result suffix filters (applies to both paths)
     anthropic_payload = apply_tool_result_suffix_filter_to_payload(anthropic_payload)
 
+    # Translate legacy thinking.type=enabled to adaptive+effort for new-protocol
+    # models (applies to both paths; must run before apply_effort_policy so the
+    # mapped effort goes through the same capability gate as a client-supplied one).
+    anthropic_payload = translate_thinking_enabled_to_adaptive(anthropic_payload, translated_model)
+
     # Decide reasoning effort support per model (applies to both paths)
     anthropic_payload = apply_effort_policy(anthropic_payload, translated_model)
 
@@ -404,15 +470,16 @@ def anthropic_messages():
 
     if use_direct_api:
         print(f"[Anthropic API] Using direct Anthropic API path for model: {translated_model}")
-        return handle_direct_anthropic_request(anthropic_payload, request_id, start_time, original_model, translated_model, original_request_body, request_headers, user_id=user_id)
+        return handle_direct_anthropic_request(anthropic_payload, request_id, start_time, original_model, translated_model, original_request_body, request_headers, client_ip=client_ip, user_id=user_id)
     else:
         print(f"[Anthropic API] Using OpenAI translation path for model: {translated_model}")
-        return handle_translated_request(anthropic_payload, request_id, start_time, original_model, translated_model, original_request_body, request_headers, user_id=user_id)
+        return handle_translated_request(anthropic_payload, request_id, start_time, original_model, translated_model, original_request_body, request_headers, client_ip=client_ip, user_id=user_id)
 
 
 def handle_direct_anthropic_request(anthropic_payload: Dict, request_id: str, start_time: float,
                                      original_model: str, translated_model: str, original_request_body: Dict = None,
                                      request_headers: Dict = None,
+                                     client_ip: str = None,
                                      user_id: str = "anonymous") -> Response:
     """Handle request using direct Anthropic API (no translation needed)."""
 
@@ -459,7 +526,7 @@ def handle_direct_anthropic_request(anthropic_payload: Dict, request_id: str, st
                     return stream_direct_anthropic(response, filtered_payload, headers, request_id,
                             filtered_request_size, start_time,
                             original_model, translated_model, original_request_body, request_headers,
-                            user_id=user_id)
+                            client_ip=client_ip, user_id=user_id)
                 last_connection_error = None
                 break
             except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
@@ -486,6 +553,7 @@ def handle_direct_anthropic_request(anthropic_payload: Dict, request_id: str, st
             usage = anthropic_response.get("usage", {})
             cache.add_request(request_id, {
                 "request_headers": request_headers,
+                "client_ip": client_ip,
                 "original_request_body": original_request_body,
                 "request_body": filtered_payload,
                 "response_body": anthropic_response,
@@ -511,7 +579,7 @@ def handle_direct_anthropic_request(anthropic_payload: Dict, request_id: str, st
 
             return jsonify(anthropic_response)
         else:
-            log_error_request("/v1/messages", current_payload, response.text, response.status_code)
+            log_error_request("/v1/messages", current_payload, response.text, response.status_code, client_ip)
             usage = {}
             try:
                 anthropic_response = response.json()
@@ -519,6 +587,7 @@ def handle_direct_anthropic_request(anthropic_payload: Dict, request_id: str, st
                 anthropic_response = response.text
             cache.add_request(request_id, {
                 "request_headers": request_headers,
+                "client_ip": client_ip,
                 "original_request_body": original_request_body,
                 "request_body": filtered_payload,
                 "response_body": anthropic_response,
@@ -581,11 +650,13 @@ def stream_direct_anthropic(response: requests.Response, filtered_payload: Dict,
                             request_size: int, start_time: float,
                             original_model: str, translated_model: str, original_request_body: Dict = None,
                             request_headers: Dict = None,
+                            client_ip: str = None,
                             user_id: str = "anonymous") -> Response:
     """Handle streaming direct Anthropic response (passthrough SSE events)."""
     # Start tracking request immediately
     cache.start_request(request_id, {
         "request_headers": request_headers,
+        "client_ip": client_ip,
         "original_request_body": original_request_body,
         "request_body": filtered_payload,
         "model": original_model,
@@ -735,6 +806,7 @@ def stream_direct_anthropic(response: requests.Response, filtered_payload: Dict,
 def handle_translated_request(anthropic_payload: Dict, request_id: str, start_time: float,
                                original_model: str, translated_model: str, original_request_body: Dict = None,
                                request_headers: Dict = None,
+                               client_ip: str = None,
                                user_id: str = "anonymous") -> Response:
     """Handle request using OpenAI translation path."""
     # Check for vision content
@@ -765,7 +837,7 @@ def handle_translated_request(anthropic_payload: Dict, request_id: str, start_ti
             return stream_anthropic_messages(openai_payload, headers, request_id,
                                             current_payload, openai_request_size, start_time,
                                             original_model, translated_model, original_request_body, request_headers,
-                                            user_id=user_id)
+                                            client_ip=client_ip, user_id=user_id)
 
         # Non-streaming request
         connection_retries = state.max_connection_retries
@@ -806,6 +878,7 @@ def handle_translated_request(anthropic_payload: Dict, request_id: str, start_ti
             cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
             cache.add_request(request_id, {
                 "request_headers": request_headers,
+                "client_ip": client_ip,
                 "original_request_body": original_request_body,
                 "request_body": openai_payload,
                 "response_body": anthropic_response,
@@ -824,7 +897,7 @@ def handle_translated_request(anthropic_payload: Dict, request_id: str, start_ti
 
             return jsonify(anthropic_response)
         else:
-            log_error_request("/v1/messages", anthropic_payload, response.text, response.status_code)
+            log_error_request("/v1/messages", anthropic_payload, response.text, response.status_code, client_ip)
 
             # Handle web search unsupported error with proxy fallback
             if (state.enable_web_search_proxy and
@@ -871,11 +944,13 @@ def stream_anthropic_messages(openai_payload: Dict, headers: Dict, request_id: s
                               anthropic_payload: Dict, request_size: int, start_time: float,
                               original_model: str, translated_model: str, original_request_body: Dict = None,
                               request_headers: Dict = None,
+                              client_ip: str = None,
                               user_id: str = "anonymous") -> Response:
     """Handle streaming Anthropic messages"""
     # Start tracking request immediately
     cache.start_request(request_id, {
         "request_headers": request_headers,
+        "client_ip": client_ip,
         "original_request_body": original_request_body,
         "request_body": openai_payload,
         "model": original_model,

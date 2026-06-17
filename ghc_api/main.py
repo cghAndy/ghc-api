@@ -93,32 +93,21 @@ def main():
             state.disable_onedrive_access = bool(config['disable_onedrive_access'])
         if 'session_flush_interval' in config:
             state.session_flush_interval = int(config['session_flush_interval'])
-        if 'enable_token_usage_reporter' in config:
-            state.enable_token_usage_reporter = bool(config['enable_token_usage_reporter'])
+
+        # Load request cache memory limits
+        if 'cache_max_entries' in config:
+            state.cache_max_entries = int(config['cache_max_entries'])
+        if 'cache_max_request_size' in config:
+            state.cache_max_request_size = int(config['cache_max_request_size'])
+        from .cache import cache as _request_cache
+        _request_cache.max_entries = state.cache_max_entries
+        _request_cache.max_request_size = state.cache_max_request_size
 
         # Load web search proxy settings
         if 'enable_web_search_proxy' in config:
             state.enable_web_search_proxy = bool(config['enable_web_search_proxy'])
         if 'web_search_proxy_endpoint' in config:
             state.web_search_proxy_endpoint = config['web_search_proxy_endpoint']
-
-        # Load cache settings
-        cache_config = config.get('cache', {}) or {}
-        from .cache import cache as request_cache
-        _cache_defaults = {'max_size_mb': 200, 'max_entries': 10000}
-        for _key, _default in _cache_defaults.items():
-            _raw = cache_config.get(_key, _default)
-            try:
-                _val = int(_raw)
-                if _val <= 0:
-                    raise ValueError(f"cache.{_key} must be > 0, got {_val}")
-            except (TypeError, ValueError) as _e:
-                print(f"[Config] Warning: invalid cache.{_key}={_raw!r} ({_e}), using default {_default}")
-                _val = _default
-            if _key == 'max_size_mb':
-                request_cache.max_size_bytes = _val * 1024 * 1024
-            else:
-                request_cache.max_entries = _val
 
         # Load user-token auth setting
         if 'enable_auth' in config:
