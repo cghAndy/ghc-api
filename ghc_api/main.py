@@ -32,6 +32,10 @@ def main():
     parser.add_argument('-p', '--port', type=int, help='Port to listen on')
     parser.add_argument('-a', '--address', type=str, help='Address to listen on')
     parser.add_argument('-c', '--config', action='store_true', help='Generate a YAML config file')
+    parser.add_argument('--enable-auth', dest='enable_auth', action='store_true', default=None,
+                        help='Require an approved user token on LLM API endpoints (overrides config)')
+    parser.add_argument('--no-enable-auth', dest='enable_auth', action='store_false',
+                        help='Disable user-token auth even if enabled in config')
     parser.add_argument('-v', '--version', action='version', version=f'ghc-api {__version__}')
 
     args = parser.parse_args()
@@ -89,6 +93,8 @@ def main():
             state.disable_onedrive_access = bool(config['disable_onedrive_access'])
         if 'session_flush_interval' in config:
             state.session_flush_interval = int(config['session_flush_interval'])
+        if 'enable_token_usage_reporter' in config:
+            state.enable_token_usage_reporter = bool(config['enable_token_usage_reporter'])
 
         # Load web search proxy settings
         if 'enable_web_search_proxy' in config:
@@ -114,6 +120,10 @@ def main():
             else:
                 request_cache.max_entries = _val
 
+        # Load user-token auth setting
+        if 'enable_auth' in config:
+            state.enable_auth = bool(config['enable_auth'])
+
         # Load model mappings from config
         if 'model_mappings' in config:
             model_mappings.load_from_config(config)
@@ -135,6 +145,23 @@ def main():
     if args.port is not None:
         print(f"Overriding port to: {args.port} (was {port})")
         port = args.port
+    if args.enable_auth is not None:
+        print(f"Overriding enable_auth to: {args.enable_auth} (was {state.enable_auth})")
+        state.enable_auth = args.enable_auth
+
+    if state.enable_auth:
+        print("\n" + "=" * 60)
+        print("[Auth] enable_auth=True — LLM API endpoints require an approved")
+        print("       user token from the registry (users.json).")
+        print("")
+        print("       WARNING: dashboard pages (/, /requests, /code-agent-manager)")
+        print("       and admin APIs (/api/users/*, /api/runtime-config, /api/config-manager/*)")
+        print("       are NOT auth-protected by ghc-api itself. In production, put")
+        print("       a reverse proxy (e.g. nginx basic-auth) in front to gate them.")
+        print("       See README \"Production deployment\" for a sample nginx config.")
+        print("")
+        print(f"       For local-only use, bind to 127.0.0.1: ghc-api --enable-auth -a 127.0.0.1")
+        print("=" * 60 + "\n")
 
     # Create the Flask app
     app = create_app()

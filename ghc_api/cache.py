@@ -12,6 +12,17 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 
+ANONYMOUS_USER_ID = "anonymous"
+
+
+def _coerce_user_id(value: Any) -> str:
+    """Normalize a user_id value to a non-empty string, defaulting to ANONYMOUS."""
+    if value is None:
+        return ANONYMOUS_USER_ID
+    text = str(value).strip()
+    return text if text else ANONYMOUS_USER_ID
+
+
 class RequestCache:
     """Thread-safe cache for storing API requests and responses"""
 
@@ -34,6 +45,13 @@ class RequestCache:
         self.endpoint_stats: Dict[str, Dict] = {}
         self.current_size_bytes: int = 0
         self.entry_sizes: Dict[str, int] = {}
+        # Per-user accumulators. Same shape as model_stats / endpoint_stats but
+        # nested under a user_id key. The global model_stats / endpoint_stats
+        # above are kept in parallel so the dashboard's "all users" view stays
+        # cheap (no per-user aggregation on read).
+        self.user_model_stats: Dict[str, Dict[str, Dict]] = {}
+        self.user_endpoint_stats: Dict[str, Dict[str, Dict]] = {}
+        self.user_totals: Dict[str, Dict[str, int]] = {}
 
     @staticmethod
     def _current_timestamp() -> int:
@@ -127,6 +145,7 @@ class RequestCache:
                 "cache_read_input_tokens": 0,
                 "duration": 0,
                 "state": self.STATE_PENDING,
+                "user_id": _coerce_user_id(data.get("user_id")),
             }
             entry_size = self._estimate_entry_size(self.cache[request_id])
             self.entry_sizes[request_id] = entry_size
@@ -167,6 +186,10 @@ class RequestCache:
                 entry["cache_read_input_tokens"] = data.get("cache_read_input_tokens", 0)
                 entry["duration"] = data.get("duration", 0)
                 entry["state"] = self.STATE_COMPLETED if data.get("status_code", 200) < 400 else self.STATE_ERROR
+                # Defensive: if user_id wasn't set during start_request (legacy
+                # path or external caller forgot), fall back to anonymous.
+                if not entry.get("user_id"):
+                    entry["user_id"] = _coerce_user_id(data.get("user_id"))
                 self._update_entry_size(request_id)
                 self._evict_until_within_limits()
             else:
@@ -190,6 +213,7 @@ class RequestCache:
                     "cache_read_input_tokens": data.get("cache_read_input_tokens", 0),
                     "duration": data.get("duration", 0),
                     "state": self.STATE_COMPLETED if data.get("status_code", 200) < 400 else self.STATE_ERROR,
+                    "user_id": _coerce_user_id(data.get("user_id")),
                 }
                 entry_size = self._estimate_entry_size(self.cache[request_id])
                 self.entry_sizes[request_id] = entry_size
@@ -198,6 +222,8 @@ class RequestCache:
             self.request_count += 1
             self.bytes_sent += data.get("request_size", 0)
             self.bytes_received += data.get("response_size", 0)
+
+            user_id = _coerce_user_id(self.cache[request_id].get("user_id"))
 
             # Update model stats using translated name when available.
             model = data.get("translated_model") or data.get("model", "unknown")
@@ -230,10 +256,78 @@ class RequestCache:
             self.endpoint_stats[endpoint]["request_count"] += 1
             self.endpoint_stats[endpoint]["bytes_sent"] += data.get("request_size", 0)
             self.endpoint_stats[endpoint]["bytes_received"] += data.get("response_size", 0)
+
+            # Per-user accumulators (kept in parallel to the global ones above).
+            self._bump_user_stats(
+                user_id=user_id,
+                model=model,
+                endpoint=endpoint,
+                input_tokens=data.get("input_tokens", 0),
+                output_tokens=data.get("output_tokens", 0),
+                cache_creation_input_tokens=data.get("cache_creation_input_tokens", 0),
+                cache_read_input_tokens=data.get("cache_read_input_tokens", 0),
+                bytes_sent=data.get("request_size", 0),
+                bytes_received=data.get("response_size", 0),
+            )
+
             entry_snapshot = dict(self.cache[request_id])
 
         if entry_snapshot:
             self._append_request_to_daily_file(entry_snapshot)
+
+    def _bump_user_stats(
+        self,
+        user_id: str,
+        model: str,
+        endpoint: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_creation_input_tokens: int,
+        cache_read_input_tokens: int,
+        bytes_sent: int,
+        bytes_received: int,
+    ) -> None:
+        """Increment the per-user accumulators. Called from within self.lock."""
+        models_for_user = self.user_model_stats.setdefault(user_id, {})
+        if model not in models_for_user:
+            models_for_user[model] = {
+                "request_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "bytes_sent": 0,
+                "bytes_received": 0,
+            }
+        m = models_for_user[model]
+        m["request_count"] += 1
+        m["input_tokens"] += input_tokens
+        m["output_tokens"] += output_tokens
+        m["cache_creation_input_tokens"] += cache_creation_input_tokens
+        m["cache_read_input_tokens"] += cache_read_input_tokens
+        m["bytes_sent"] += bytes_sent
+        m["bytes_received"] += bytes_received
+
+        endpoints_for_user = self.user_endpoint_stats.setdefault(user_id, {})
+        if endpoint not in endpoints_for_user:
+            endpoints_for_user[endpoint] = {
+                "request_count": 0,
+                "bytes_sent": 0,
+                "bytes_received": 0,
+            }
+        e = endpoints_for_user[endpoint]
+        e["request_count"] += 1
+        e["bytes_sent"] += bytes_sent
+        e["bytes_received"] += bytes_received
+
+        totals = self.user_totals.setdefault(user_id, {
+            "request_count": 0,
+            "bytes_sent": 0,
+            "bytes_received": 0,
+        })
+        totals["request_count"] += 1
+        totals["bytes_sent"] += bytes_sent
+        totals["bytes_received"] += bytes_received
 
     def _append_request_to_daily_file(self, request_entry: Dict[str, Any]) -> None:
         try:
@@ -273,36 +367,67 @@ class RequestCache:
         with self.lock:
             return self.cache.get(request_id)
 
-    def get_recent_requests(self, limit: int = 50, offset: int = 0) -> List[Dict]:
-        """Get recent requests with pagination"""
+    def get_recent_requests(self, limit: int = 50, offset: int = 0, user_id: Optional[str] = None) -> List[Dict]:
+        """Get recent requests with pagination, optionally filtered by user_id."""
         with self.lock:
             items = list(reversed(list(self.cache.values())))
+            if user_id is not None:
+                items = [it for it in items if _coerce_user_id(it.get("user_id")) == user_id]
             return items[offset:offset + limit]
 
-    def get_total_count(self) -> int:
-        """Get total number of cached requests"""
+    def get_total_count(self, user_id: Optional[str] = None) -> int:
+        """Get total number of cached requests (optionally for a single user)."""
         with self.lock:
-            return len(self.cache)
+            if user_id is None:
+                return len(self.cache)
+            return sum(1 for it in self.cache.values() if _coerce_user_id(it.get("user_id")) == user_id)
 
-    def get_stats(self) -> Dict:
-        """Get overall statistics"""
+    def get_stats(self, user_id: Optional[str] = None) -> Dict:
+        """Get overall statistics. When user_id is provided, returns that user's
+        slice; otherwise returns global stats (the historical behavior)."""
         with self.lock:
+            if user_id is None:
+                return {
+                    "user_id": None,
+                    "total_requests": self.request_count,
+                    "cached_requests": len(self.cache),
+                    "bytes_sent": self.bytes_sent,
+                    "bytes_received": self.bytes_received,
+                    "model_stats": dict(self.model_stats),
+                    "endpoint_stats": dict(self.endpoint_stats),
+                    "cache_size_bytes": self.current_size_bytes,
+                    "cache_size_mb": round(self.current_size_bytes / (1024 * 1024), 2),
+                    "cache_max_size_mb": self.max_size_bytes // (1024 * 1024),
+                    "cache_entry_count": len(self.cache),
+                    "cache_max_entries": self.max_entries,
+                }
+
+            totals = self.user_totals.get(user_id, {
+                "request_count": 0,
+                "bytes_sent": 0,
+                "bytes_received": 0,
+            })
+            cached_for_user = sum(
+                1 for it in self.cache.values()
+                if _coerce_user_id(it.get("user_id")) == user_id
+            )
             return {
-                "total_requests": self.request_count,
-                "cached_requests": len(self.cache),
-                "bytes_sent": self.bytes_sent,
-                "bytes_received": self.bytes_received,
-                "model_stats": dict(self.model_stats),
-                "endpoint_stats": dict(self.endpoint_stats),
+                "user_id": user_id,
+                "total_requests": totals["request_count"],
+                "cached_requests": cached_for_user,
+                "bytes_sent": totals["bytes_sent"],
+                "bytes_received": totals["bytes_received"],
+                "model_stats": dict(self.user_model_stats.get(user_id, {})),
+                "endpoint_stats": dict(self.user_endpoint_stats.get(user_id, {})),
                 "cache_size_bytes": self.current_size_bytes,
                 "cache_size_mb": round(self.current_size_bytes / (1024 * 1024), 2),
                 "cache_max_size_mb": self.max_size_bytes // (1024 * 1024),
-                "cache_entry_count": len(self.cache),
+                "cache_entry_count": cached_for_user,
                 "cache_max_entries": self.max_entries,
             }
 
     def get_model_token_snapshot(self) -> Dict[str, Dict[str, int]]:
-        """Get a thread-safe snapshot of model token counters."""
+        """Get a thread-safe snapshot of model token counters (global)."""
         with self.lock:
             return {
                 model: {
@@ -317,24 +442,55 @@ class RequestCache:
                 for model, stats in self.model_stats.items()
             }
 
-    def search_requests(self, query: str, limit: int = 50, offset: int = 0) -> List[Dict]:
-        """Search requests by model, endpoint, or content"""
+    def get_user_model_token_snapshot(self) -> Dict[Tuple[str, str], Dict[str, int]]:
+        """Get a thread-safe snapshot of token counters keyed by (user_id, model).
+
+        Used by the token-usage reporter to produce per-user JSONL deltas."""
+        with self.lock:
+            snapshot: Dict[Tuple[str, str], Dict[str, int]] = {}
+            for user_id, models in self.user_model_stats.items():
+                for model, stats in models.items():
+                    snapshot[(user_id, model)] = {
+                        "request_count": int(stats.get("request_count", 0)),
+                        "input_tokens": int(stats.get("input_tokens", 0)),
+                        "output_tokens": int(stats.get("output_tokens", 0)),
+                        "cache_creation_input_tokens": int(stats.get("cache_creation_input_tokens", 0)),
+                        "cache_read_input_tokens": int(stats.get("cache_read_input_tokens", 0)),
+                        "bytes_sent": int(stats.get("bytes_sent", 0)),
+                        "bytes_received": int(stats.get("bytes_received", 0)),
+                    }
+            return snapshot
+
+    def list_user_ids(self) -> List[str]:
+        """List all user_ids that have any data in the cache or stats."""
+        with self.lock:
+            ids = set(self.user_model_stats.keys()) | set(self.user_totals.keys())
+            for entry in self.cache.values():
+                ids.add(_coerce_user_id(entry.get("user_id")))
+            return sorted(ids)
+
+    def search_requests(self, query: str, limit: int = 50, offset: int = 0, user_id: Optional[str] = None) -> List[Dict]:
+        """Search requests by model, endpoint, or content (optionally per-user)."""
         with self.lock:
             results = []
             query_lower = query.lower()
             for item in reversed(list(self.cache.values())):
+                if user_id is not None and _coerce_user_id(item.get("user_id")) != user_id:
+                    continue
                 if (query_lower in item.get("model", "").lower() or
                     query_lower in item.get("endpoint", "").lower() or
                     query_lower in json.dumps(item.get("request_body", {})).lower()):
                     results.append(item)
             return results[offset:offset + limit]
 
-    def fulltext_search(self, query: str, limit: int = 50, offset: int = 0) -> Tuple[List[Dict], int]:
-        """Full-text search in request and response bodies"""
+    def fulltext_search(self, query: str, limit: int = 50, offset: int = 0, user_id: Optional[str] = None) -> Tuple[List[Dict], int]:
+        """Full-text search in request and response bodies (optionally per-user)."""
         with self.lock:
             results = []
             query_lower = query.lower()
             for item in reversed(list(self.cache.values())):
+                if user_id is not None and _coerce_user_id(item.get("user_id")) != user_id:
+                    continue
                 # Search in request body
                 request_body_str = json.dumps(item.get("request_body", {})).lower()
                 # Search in response body
@@ -355,7 +511,7 @@ class RequestCache:
         """Import a single request entry"""
         with self.lock:
             request_id = data.get("id", str(uuid.uuid4()))
-
+            user_id = _coerce_user_id(data.get("user_id"))
             self.cache[request_id] = {
                 "id": request_id,
                 "timestamp": self._normalize_import_timestamp(data.get("timestamp")),
@@ -375,6 +531,7 @@ class RequestCache:
                 "cache_read_input_tokens": data.get("cache_read_input_tokens", 0),
                 "duration": data.get("duration", 0),
                 "state": data.get("state", "completed"),
+                "user_id": user_id,
             }
             entry_size = self._estimate_entry_size(self.cache[request_id])
             self.entry_sizes[request_id] = entry_size
@@ -415,6 +572,19 @@ class RequestCache:
             self.endpoint_stats[endpoint]["request_count"] += 1
             self.endpoint_stats[endpoint]["bytes_sent"] += data.get("request_size", 0)
             self.endpoint_stats[endpoint]["bytes_received"] += data.get("response_size", 0)
+
+            # Per-user accumulators.
+            self._bump_user_stats(
+                user_id=user_id,
+                model=model,
+                endpoint=endpoint,
+                input_tokens=data.get("input_tokens", 0),
+                output_tokens=data.get("output_tokens", 0),
+                cache_creation_input_tokens=data.get("cache_creation_input_tokens", 0),
+                cache_read_input_tokens=data.get("cache_read_input_tokens", 0),
+                bytes_sent=data.get("request_size", 0),
+                bytes_received=data.get("response_size", 0),
+            )
 
 
 # Global cache instance

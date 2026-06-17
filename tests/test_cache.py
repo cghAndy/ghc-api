@@ -4,7 +4,7 @@ from unittest import mock
 
 from flask import Flask
 
-from ghc_api.cache import RequestCache
+from ghc_api.cache import ANONYMOUS_USER_ID, RequestCache
 from ghc_api.routes import dashboard as dashboard_routes
 
 
@@ -212,6 +212,65 @@ class RequestCacheMemoryEvictionTests(unittest.TestCase):
         self.assertEqual(stats["cache_max_size_mb"], 200)
         self.assertEqual(stats["cache_max_entries"], 10000)
         self.assertEqual(stats["cache_entry_count"], 1)
+
+
+class RequestCachePerUserStatsTests(unittest.TestCase):
+    def test_get_stats_for_user_keeps_cache_fields(self) -> None:
+        cache = RequestCache(max_size_mb=200, max_entries=10000)
+        cache.start_request("req-u1", {"model": "gpt-5", "endpoint": "/v1/chat", "user_id": "user-1"})
+        cache.complete_request("req-u1", {
+            "model": "gpt-5",
+            "endpoint": "/v1/chat",
+            "request_size": 10,
+            "response_size": 20,
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "user_id": "user-1",
+        })
+        cache.start_request("req-anon", {"model": "gpt-5", "endpoint": "/v1/chat"})
+
+        stats = cache.get_stats(user_id="user-1")
+        self.assertEqual(stats["user_id"], "user-1")
+        self.assertEqual(stats["total_requests"], 1)
+        self.assertEqual(stats["cached_requests"], 1)
+        self.assertEqual(stats["cache_entry_count"], 1)
+        self.assertEqual(stats["cache_max_size_mb"], 200)
+        self.assertEqual(stats["cache_max_entries"], 10000)
+        self.assertIn("gpt-5", stats["model_stats"])
+
+    def test_per_user_filters_for_recent_search_and_fulltext(self) -> None:
+        cache = RequestCache()
+        cache.start_request("req-u1", {
+            "model": "gpt-5",
+            "endpoint": "/v1/chat/completions",
+            "request_body": {"messages": [{"content": "hello user one"}]},
+            "user_id": "user-1",
+        })
+        cache.start_request("req-u2", {
+            "model": "claude-opus-4.6",
+            "endpoint": "/v1/messages",
+            "request_body": {"messages": [{"content": "hello user two"}]},
+            "user_id": "user-2",
+        })
+        cache.start_request("req-anon", {
+            "model": "gpt-5",
+            "endpoint": "/v1/chat/completions",
+            "request_body": {"messages": [{"content": "hello anonymous"}]},
+        })
+
+        recent_u1 = cache.get_recent_requests(user_id="user-1")
+        self.assertEqual(len(recent_u1), 1)
+        self.assertEqual(recent_u1[0]["id"], "req-u1")
+        self.assertEqual(cache.get_total_count(user_id=ANONYMOUS_USER_ID), 1)
+
+        search_u2 = cache.search_requests("claude-opus-4.6", user_id="user-2")
+        self.assertEqual(len(search_u2), 1)
+        self.assertEqual(search_u2[0]["id"], "req-u2")
+
+        fulltext_u1, total_u1 = cache.fulltext_search("user one", user_id="user-1")
+        self.assertEqual(total_u1, 1)
+        self.assertEqual(len(fulltext_u1), 1)
+        self.assertEqual(fulltext_u1[0]["id"], "req-u1")
 
 
 if __name__ == "__main__":

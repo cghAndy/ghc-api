@@ -130,6 +130,14 @@ disable_onedrive_access: true
 # Lower values mean less data loss on crash but more disk I/O.
 session_flush_interval: 5
 
+# Token Usage Reporter
+# --------------------
+# When true, a background worker periodically writes per-user/model token usage
+# deltas to the OneDrive agent folder (token_usage.jl), or a local fallback file
+# (~/.ghc-api/token_usage.jl) when OneDrive is unavailable.
+# When false (default), the reporter never starts.
+enable_token_usage_reporter: false
+
 # Web Search Proxy Settings
 # -------------------------
 # When enabled, if the Copilot backend rejects a request containing the web_search tool
@@ -155,6 +163,25 @@ web_search_proxy_endpoint: "http://127.0.0.1:5002"
 cache:
   max_size_mb: 200    # Maximum total memory for cached bodies in MB (default: 200)
   max_entries: 10000  # Hard cap on number of cached entries (default: 10000)
+
+# User Authentication
+# -------------------
+# When true, the LLM API endpoints (/v1/chat/completions, /v1/messages, /v1/responses,
+# /v1/models, etc.) require an approved user token. Users register at /signup; an
+# administrator approves the token from the dashboard before it becomes usable.
+#
+# Token is accepted in any of these forms (first match wins):
+#   - Authorization: Bearer <token>      (OpenAI SDK, Claude Code's ANTHROPIC_AUTH_TOKEN, Codex)
+#   - x-api-key: <token>                 (Anthropic SDK's ANTHROPIC_API_KEY)
+#   - ?api_key=<token>                   (query parameter, for curl one-liners)
+#
+# When false (default), all requests proceed without auth and are tagged with
+# user_id="anonymous" in the dashboard and token-usage stats.
+#
+# The user registry (users.json) is stored under the OneDrive configSync folder when
+# OneDrive is detected (shared across machines); otherwise it falls back to the local
+# ghc-api config directory.
+enable_auth: false
 
 """.format(
         vscode_version=DEFAULT_VSCODE_VERSION,
