@@ -130,13 +130,21 @@ disable_onedrive_access: true
 # Lower values mean less data loss on crash but more disk I/O.
 session_flush_interval: 5
 
-# Token Usage Reporter
-# --------------------
-# When true, a background worker periodically writes per-user/model token usage
-# deltas to the OneDrive agent folder (token_usage.jl), or a local fallback file
-# (~/.ghc-api/token_usage.jl) when OneDrive is unavailable.
-# When false (default), the reporter never starts.
-enable_token_usage_reporter: false
+# Request Cache Memory Limits
+# ---------------------------
+# Recent requests are kept in memory for the dashboard / inspection UI.
+# These settings cap how much memory that cache may use.
+#
+# cache_max_entries: Maximum number of recent requests to keep in memory.
+#                    Older entries are evicted FIFO once this limit is reached.
+# cache_max_request_size: Maximum size in bytes for a single cached entry's
+#                         request or response body. If a body exceeds this
+#                         limit it is replaced with a small placeholder so the
+#                         metadata is preserved without holding the full
+#                         payload in memory. Set to 0 to disable the per-entry
+#                         size limit.
+cache_max_entries: 1000
+cache_max_request_size: 1048576
 
 # Web Search Proxy Settings
 # -------------------------
@@ -151,18 +159,6 @@ enable_token_usage_reporter: false
 # web_search_proxy_endpoint: The URL of the search proxy service
 enable_web_search_proxy: false
 web_search_proxy_endpoint: "http://127.0.0.1:5002"
-
-# Memory Cache Settings
-# ---------------------
-# Controls the in-memory request/response cache used by the dashboard.
-#
-# max_size_mb: Maximum total memory used by cached request/response bodies (MB).
-#              When exceeded, the oldest entries are evicted (FIFO).
-# max_entries: Hard cap on the number of cached entries (safety fallback).
-#              Entries are also evicted when this limit is exceeded.
-cache:
-  max_size_mb: 200    # Maximum total memory for cached bodies in MB (default: 200)
-  max_entries: 10000  # Hard cap on number of cached entries (default: 10000)
 
 # User Authentication
 # -------------------
